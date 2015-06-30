@@ -60,14 +60,18 @@ def get_subjectinfo(subject_id, base_dir, task_id, model_id):
     import os
     import numpy as np
     condition_info = []
-    cond_file = os.path.join(base_dir, 'models', 'model%03d' % model_id,
-                             'condition_key.txt')
-    with open(cond_file, 'rt') as fp:
-        for line in fp:
-            info = line.strip().split()
-            condition_info.append([info[0], info[1], ' '.join(info[2:])])
-    if len(condition_info) == 0:
-        raise ValueError('No condition info found in %s' % cond_file)
+    if model_id >= 0:
+        cond_file = os.path.join(base_dir, 'models', 'model%03d' % model_id,
+                                 'condition_key.txt')
+        with open(cond_file, 'rt') as fp:
+            for line in fp:
+                info = line.strip().split()
+                condition_info.append([info[0], info[1], ' '.join(info[2:])])
+        if len(condition_info) == 0:
+            raise ValueError('No condition info found in %s' % cond_file)
+    else:
+        #  simulate present single condition
+        condition_info.append(["task001", "cond001", "nothing"])
     taskinfo = np.array(condition_info)
     n_tasks = len(np.unique(taskinfo[:, 0]))
     conds = []
@@ -88,6 +92,8 @@ def get_subjectinfo(subject_id, base_dir, task_id, model_id):
 
 
 def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
+                             reslice_functionals=False,
+                             hpcutoff=120.0, fwhm=6.0,
                              task_id=None, output_dir=None, subj_prefix='*'):
     """Analyzes an open fmri dataset
 
@@ -106,9 +112,13 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     """
 
     preproc = create_featreg_preproc(whichvol='first')
-    modelfit = create_modelfit_workflow()
-    fixed_fx = create_fixed_effects_flow()
-    registration = create_reg_workflow()
+    if model_id >= 0:
+        modelfit = create_modelfit_workflow()
+        fixed_fx = create_fixed_effects_flow()
+    else:
+        fixed_fx = modelfit = None
+
+    registration = create_reg_workflow(do_func2anat_bbr=False)
 
     """
     Remove the plotting connection so that plot iterables don't propagate
@@ -152,22 +162,27 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
 
     datasource = pe.Node(nio.DataGrabber(infields=['subject_id', 'run_id',
                                                    'task_id', 'model_id'],
-                                         outfields=['anat', 'bold', 'behav',
-                                                    'contrasts']),
+                                         outfields=['anat', 'bold'] \
+                                            + (['behav', 'contrasts'] if modelfit else [])),
                          name='datasource')
     datasource.inputs.base_directory = data_dir
     datasource.inputs.template = '*'
     datasource.inputs.field_template = {'anat': '%s/anatomy/highres001.nii.gz',
-                                'bold': '%s/BOLD/task%03d_r*/bold.nii.gz',
+                                'bold': '%s/BOLD/task%03d_r*/bold.nii.gz'}
+    if modelfit:
+        datasource.inputs.field_template.update({
                                 'behav': ('%s/model/model%03d/onsets/task%03d_'
                                           'run%03d/cond*.txt'),
                                 'contrasts': ('models/model%03d/'
-                                              'task_contrasts.txt')}
+                                              'task_contrasts.txt')})
+
     datasource.inputs.template_args = {'anat': [['subject_id']],
-                                       'bold': [['subject_id', 'task_id']],
+                                       'bold': [['subject_id', 'task_id']]}
+    if modelfit:
+        datasource.inputs.template_args.update({
                                        'behav': [['subject_id', 'model_id',
                                                   'task_id', 'run_id']],
-                                       'contrasts': [['model_id']]}
+                                       'contrasts': [['model_id']]})
     datasource.inputs.sort_filelist = True
 
     """
@@ -248,19 +263,21 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
                 out_behav.append(val)
         return out_behav
 
-    wf.connect(subjinfo, 'TR', modelspec, 'time_repetition')
-    wf.connect(datasource, ('behav', check_behav_list), modelspec, 'event_files')
-    wf.connect(subjinfo, 'TR', modelfit, 'inputspec.interscan_interval')
-    wf.connect(subjinfo, 'conds', contrastgen, 'conds')
-    wf.connect(datasource, 'contrasts', contrastgen, 'contrast_file')
-    wf.connect(infosource, 'task_id', contrastgen, 'task_id')
-    wf.connect(contrastgen, 'contrasts', modelfit, 'inputspec.contrasts')
+    if modelfit:
+        wf.connect(subjinfo, 'TR', modelspec, 'time_repetition')
+        wf.connect(datasource, ('behav', check_behav_list), modelspec, 'event_files')
+        wf.connect(subjinfo, 'TR', modelfit, 'inputspec.interscan_interval')
+        wf.connect(subjinfo, 'conds', contrastgen, 'conds')
+        wf.connect(datasource, 'contrasts', contrastgen, 'contrast_file')
+        wf.connect(infosource, 'task_id', contrastgen, 'task_id')
+        wf.connect(contrastgen, 'contrasts', modelfit, 'inputspec.contrasts')
 
     wf.connect([(preproc, art, [('outputspec.motion_parameters',
                                  'realignment_parameters'),
                                 ('outputspec.realigned_files',
                                  'realigned_files'),
-                                ('outputspec.mask', 'mask_file')]),
+                                ('outputspec.mask', 'mask_file')])]
+               + ([
                 (preproc, modelspec, [('outputspec.highpassed_files',
                                        'functional_runs'),
                                       ('outputspec.motion_parameters',
@@ -270,39 +287,40 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
                                         'inputspec.session_info')]),
                 (preproc, modelfit, [('outputspec.highpassed_files',
                                       'inputspec.functional_data')])
-                ])
+                ] if modelfit else []))
 
-    """
-    Reorder the copes so that now it combines across runs
-    """
+    if modelfit:
+        """
+        Reorder the copes so that now it combines across runs
+        """
 
-    def sort_copes(files):
-        numelements = len(files[0])
-        outfiles = []
-        for i in range(numelements):
-            outfiles.insert(i, [])
-            for j, elements in enumerate(files):
-                outfiles[i].append(elements[i])
-        return outfiles
+        def sort_copes(files):
+            numelements = len(files[0])
+            outfiles = []
+            for i in range(numelements):
+                outfiles.insert(i, [])
+                for j, elements in enumerate(files):
+                    outfiles[i].append(elements[i])
+            return outfiles
 
-    def num_copes(files):
-        return len(files)
+        def num_copes(files):
+            return len(files)
 
-    pickfirst = lambda x: x[0]
+        pickfirst = lambda x: x[0]
 
-    wf.connect([(preproc, fixed_fx, [(('outputspec.mask', pickfirst),
-                                      'flameo.mask_file')]),
-                (modelfit, fixed_fx, [(('outputspec.copes', sort_copes),
-                                       'inputspec.copes'),
-                                       ('outputspec.dof_file',
-                                        'inputspec.dof_files'),
-                                       (('outputspec.varcopes',
-                                         sort_copes),
-                                        'inputspec.varcopes'),
-                                       (('outputspec.copes', num_copes),
-                                        'l2model.num_copes'),
-                                       ])
-                ])
+        wf.connect([(preproc, fixed_fx, [(('outputspec.mask', pickfirst),
+                                          'flameo.mask_file')]),
+                    (modelfit, fixed_fx, [(('outputspec.copes', sort_copes),
+                                           'inputspec.copes'),
+                                           ('outputspec.dof_file',
+                                            'inputspec.dof_files'),
+                                           (('outputspec.varcopes',
+                                             sort_copes),
+                                            'inputspec.varcopes'),
+                                           (('outputspec.copes', num_copes),
+                                            'l2model.num_copes'),
+                                           ])
+                    ])
 
     wf.connect(preproc, 'outputspec.mean', registration, 'inputspec.mean_image')
     wf.connect(datasource, 'anat', registration, 'inputspec.anatomical_image')
@@ -321,32 +339,36 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
         splits.append(len(zstats))
         return out_files, splits
 
-    mergefunc = pe.Node(niu.Function(input_names=['copes', 'varcopes',
-                                                  'zstats'],
-                                   output_names=['out_files', 'splits'],
-                                   function=merge_files),
-                      name='merge_files')
-    wf.connect([(fixed_fx.get_node('outputspec'), mergefunc,
-                                 [('copes', 'copes'),
-                                  ('varcopes', 'varcopes'),
-                                  ('zstats', 'zstats'),
-                                  ])])
-    wf.connect(mergefunc, 'out_files', registration, 'inputspec.source_files')
+    if modelfit:
+        mergefunc = pe.Node(niu.Function(input_names=['copes', 'varcopes',
+                                                      'zstats'],
+                                       output_names=['out_files', 'splits'],
+                                       function=merge_files),
+                          name='merge_files')
+        wf.connect([(fixed_fx.get_node('outputspec'), mergefunc,
+                                     [('copes', 'copes'),
+                                      ('varcopes', 'varcopes'),
+                                      ('zstats', 'zstats'),
+                                      ])])
+        wf.connect(mergefunc, 'out_files', registration, 'inputspec.source_files')
 
-    def split_files(in_files, splits):
-        copes = in_files[:splits[0]]
-        varcopes = in_files[splits[0]:(splits[0] + splits[1])]
-        zstats = in_files[(splits[0] + splits[1]):]
-        return copes, varcopes, zstats
+        def split_files(in_files, splits):
+            copes = in_files[:splits[0]]
+            varcopes = in_files[splits[0]:(splits[0] + splits[1])]
+            zstats = in_files[(splits[0] + splits[1]):]
+            return copes, varcopes, zstats
 
-    splitfunc = pe.Node(niu.Function(input_names=['in_files', 'splits'],
-                                     output_names=['copes', 'varcopes',
-                                                   'zstats'],
-                                     function=split_files),
-                      name='split_files')
-    wf.connect(mergefunc, 'splits', splitfunc, 'splits')
-    wf.connect(registration, 'outputspec.transformed_files',
-               splitfunc, 'in_files')
+        splitfunc = pe.Node(niu.Function(input_names=['in_files', 'splits'],
+                                         output_names=['copes', 'varcopes',
+                                                       'zstats'],
+                                         function=split_files),
+                          name='split_files')
+        wf.connect(mergefunc, 'splits', splitfunc, 'splits')
+        wf.connect(registration, 'outputspec.transformed_files',
+                   splitfunc, 'in_files')
+    elif reslice_functionals:
+        wf.connect(preproc, 'outputspec.highpassed_files',
+                   registration, 'inputspec.source_files')
 
 
     """
@@ -357,10 +379,16 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
         subs = [('_subject_id_%s_' % subject_id, '')]
         subs.append(('_model_id_%d' % model_id, 'model%03d' %model_id))
         subs.append(('task_id_%d/' % task_id, '/task%03d_' % task_id))
+        subs.append(('task_id_%d/' % task_id, '/task%03d_' % task_id))
+        subs.append(('bold_dtype_mcf_mask_smooth_mask_gms_tempfilt_maths_warp',
+                     'bold_mc_tempfilt_mni'))
+        subs.append(('task%03d_bold_dtype_mcf_mask_smooth_mask_gms_mean_warp' % task_id,
+                     'mean'))
         subs.append(('bold_dtype_mcf_mask_smooth_mask_gms_tempfilt_mean_warp',
         'mean'))
         subs.append(('bold_dtype_mcf_mask_smooth_mask_gms_tempfilt_mean_flirt',
         'affine'))
+
 
         for i in range(len(conds)):
             subs.append(('_flameo%d/cope1.' % i, 'cope%02d.' % (i + 1)))
@@ -388,35 +416,55 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     wf.connect(infosource, 'subject_id', subsgen, 'subject_id')
     wf.connect(infosource, 'model_id', subsgen, 'model_id')
     wf.connect(infosource, 'task_id', subsgen, 'task_id')
-    wf.connect(contrastgen, 'contrasts', subsgen, 'conds')
+    #wf.connect(subinfo, 'run_ids', subsgen, 'run_ids')
+
+    datasink.inputs.regexp_substitutions = [
+        (r'_warpall(\d)', r'run00\1'),
+        ('model-01/', ''),
+        ]
+
     wf.connect(subsgen, 'substitutions', datasink, 'substitutions')
-    wf.connect([(fixed_fx.get_node('outputspec'), datasink,
-                                 [('res4d', 'res4d'),
-                                  ('copes', 'copes'),
-                                  ('varcopes', 'varcopes'),
-                                  ('zstats', 'zstats'),
-                                  ('tstats', 'tstats')])
-                                 ])
-    wf.connect([(splitfunc, datasink,
-                 [('copes', 'copes.mni'),
-                  ('varcopes', 'varcopes.mni'),
-                  ('zstats', 'zstats.mni'),
-                  ])])
-    wf.connect(registration, 'outputspec.transformed_mean', datasink, 'mean.mni')
+    if modelfit:
+        wf.connect(contrastgen, 'contrasts', subsgen, 'conds')
+        wf.connect([(fixed_fx.get_node('outputspec'), datasink,
+                     [('res4d', 'res4d'),
+                      ('copes', 'copes'),
+                      ('varcopes', 'varcopes'),
+                      ('zstats', 'zstats'),
+                      ('tstats', 'tstats')])
+                    ])
+        wf.connect([(splitfunc, datasink,
+                     [('copes', 'copes.mni'),
+                      ('varcopes', 'varcopes.mni'),
+                      ('zstats', 'zstats.mni'),
+                      ])])
+    else:
+        subsgen.inputs.conds = []
+        if reslice_functionals:
+            wf.connect([(registration, datasink,
+                        #[('outputspec.transformed_files', 'bold.filt.mni'),
+                        [('outputspec.transformed_files', 'BOLD'),
+                          ])])
+    wf.connect(registration, 'outputspec.transformed_mean', datasink, 'BOLD.mean')
     wf.connect(registration, 'outputspec.func2anat_transform', datasink, 'xfm.mean2anat')
     wf.connect(registration, 'outputspec.anat2target_transform', datasink, 'xfm.anat2target')
+    wf.connect(registration, 'outputspec.anat2target_transformed', datasink, 'anatomy')
+    wf.connect(preproc,      'plot_motion.out_file', datasink, 'BOLD.qa.mc.plt')
+    wf.connect(preproc,      'outputspec.motion_parameters', datasink, 'BOLD.qa.mc')
+    wf.connect(art,          'outlier_files', datasink, 'BOLD.qa.art')
+    wf.connect(art,          'plot_files', datasink, 'BOLD.qa.art.plt')
 
     """
     Set processing parameters
     """
 
-    hpcutoff = 120.
-    preproc.inputs.inputspec.fwhm = 6.0
+    preproc.inputs.inputspec.fwhm = fwhm
     gethighpass.inputs.hpcutoff = hpcutoff
-    modelspec.inputs.high_pass_filter_cutoff = hpcutoff
-    modelfit.inputs.inputspec.bases = {'dgamma': {'derivs': True}}
-    modelfit.inputs.inputspec.model_serial_correlations = True
-    modelfit.inputs.inputspec.film_threshold = 1000
+    if modelfit:
+        modelspec.inputs.high_pass_filter_cutoff = hpcutoff
+        modelfit.inputs.inputspec.bases = {'dgamma': {'derivs': True}}
+        modelfit.inputs.inputspec.model_serial_correlations = True
+        modelfit.inputs.inputspec.film_threshold = 1000
 
     datasink.inputs.base_directory = output_dir
     return wf
@@ -435,7 +483,9 @@ if __name__ == '__main__':
                         nargs='+', type=str,
                         help="Subject name (e.g. 'sub001')")
     parser.add_argument('-m', '--model', default=1,
-                        help="Model index" + defstr)
+                        help="Model index. If negative -- no stats estimated. " + defstr)
+    parser.add_argument("--reslice-functionals", action="store_true",
+                        help="Reslice filtered functionals into standard space")
     parser.add_argument('-x', '--subjectprefix', default='sub*',
                         help="Subject prefix" + defstr)
     parser.add_argument('-t', '--task', default=1, #nargs='+',
@@ -449,6 +499,12 @@ if __name__ == '__main__':
                         help="Plugin to use")
     parser.add_argument("--plugin_args", dest="plugin_args",
                         help="Plugin arguments")
+    parser.add_argument("--hpcutoff", type=float, default=120.,
+                        help="Cut-off for high pass filtering")
+    parser.add_argument("--fwhm", type=float, default=6.0,
+                        help="FWHM for spatial filtering")
+    parser.add_argument("--write-graph", default="",
+                       help="Do not run, just write the graph to specified file")
     args = parser.parse_args()
     outdir = args.outdir
     work_dir = os.getcwd()
@@ -463,11 +519,16 @@ if __name__ == '__main__':
     wf = analyze_openfmri_dataset(data_dir=os.path.abspath(args.datasetdir),
                              subject=args.subject,
                              model_id=int(args.model),
+                             reslice_functionals=args.reslice_functionals,
                              task_id=[int(args.task)],
                              subj_prefix=args.subjectprefix,
+                             hpcutoff=args.hpcutoff,
+                             fwhm=args.fwhm,
                              output_dir=outdir)
     wf.base_dir = work_dir
-    if args.plugin_args:
+    if args.write_graph:
+        wf.write_graph(args.write_graph)
+    elif args.plugin_args:
         wf.run(args.plugin, plugin_args=eval(args.plugin_args))
     else:
         wf.run(args.plugin)

@@ -1095,7 +1095,7 @@ def create_fsl_fs_preproc(name='preproc', highpass=True, whichvol='middle'):
 
     return featpreproc
 
-def create_reg_workflow(name='registration'):
+def create_reg_workflow(name='registration', do_func2anat_bbr=True):
     """Create a FEAT preprocessing workflow
 
     Parameters
@@ -1116,6 +1116,7 @@ def create_reg_workflow(name='registration'):
 
         outputspec.func2anat_transform : FLIRT transform
         outputspec.anat2target_transform : FLIRT+FNIRT transform
+        outputspec.anat2target_transformed : FLIRT+FNIRT transformed anatomical_image
         outputspec.transformed_files : transformed files in target space
         outputspec.transformed_mean : mean image in target space
 
@@ -1135,6 +1136,7 @@ def create_reg_workflow(name='registration'):
                         name='inputspec')
     outputnode = pe.Node(interface=util.IdentityInterface(fields=['func2anat_transform',
                                                               'anat2target_transform',
+                                                              'anat2target_transformed',
                                                               'transformed_files',
                                                               'transformed_mean',
                                                               ]),
@@ -1169,20 +1171,21 @@ def create_reg_workflow(name='registration'):
     register.connect(inputnode, 'mean_image', mean2anat, 'in_file')
     register.connect(stripper, 'out_file', mean2anat, 'reference')
 
-    """
-    Now use bbr cost function to improve the transform
-    """
+    if do_func2anat_bbr:
+        """
+        Now use bbr cost function to improve the transform
+        """
 
-    mean2anatbbr = pe.Node(fsl.FLIRT(), name='mean2anatbbr')
-    mean2anatbbr.inputs.dof = 6
-    mean2anatbbr.inputs.cost = 'bbr'
-    mean2anatbbr.inputs.schedule = os.path.join(os.getenv('FSLDIR'),
-                                                'etc/flirtsch/bbr.sch')
-    register.connect(inputnode, 'mean_image', mean2anatbbr, 'in_file')
-    register.connect(binarize, 'out_file', mean2anatbbr, 'wm_seg')
-    register.connect(inputnode, 'anatomical_image', mean2anatbbr, 'reference')
-    register.connect(mean2anat, 'out_matrix_file',
-                     mean2anatbbr, 'in_matrix_file')
+        mean2anatbbr = pe.Node(fsl.FLIRT(), name='mean2anatbbr')
+        mean2anatbbr.inputs.dof = 6
+        mean2anatbbr.inputs.cost = 'bbr'
+        mean2anatbbr.inputs.schedule = os.path.join(os.getenv('FSLDIR'),
+                                                    'etc/flirtsch/bbr.sch')
+        register.connect(inputnode, 'mean_image', mean2anatbbr, 'in_file')
+        register.connect(binarize, 'out_file', mean2anatbbr, 'wm_seg')
+        register.connect(inputnode, 'anatomical_image', mean2anatbbr, 'reference')
+        register.connect(mean2anat, 'out_matrix_file',
+                         mean2anatbbr, 'in_matrix_file')
 
     """
     Calculate affine transform from anatomical to target
@@ -1199,7 +1202,7 @@ def create_reg_workflow(name='registration'):
     """
     Calculate nonlinear transform from anatomical to target
     """
-
+    # TODO:  why here non-stripped brain was taken for non-linear portion
     anat2target_nonlinear = pe.Node(fsl.FNIRT(), name='anat2target_nonlinear')
     anat2target_nonlinear.inputs.fieldcoeff_file=True
     register.connect(anat2target_affine, 'out_matrix_file',
@@ -1217,7 +1220,8 @@ def create_reg_workflow(name='registration'):
 
     warpmean = pe.Node(fsl.ApplyWarp(interp='spline'), name='warpmean')
     register.connect(inputnode, 'mean_image', warpmean, 'in_file')
-    register.connect(mean2anatbbr, 'out_matrix_file', warpmean, 'premat')
+    register.connect(mean2anatbbr if do_func2anat_bbr else mean2anat, 'out_matrix_file',
+                     warpmean, 'premat')
     register.connect(inputnode, 'target_image', warpmean, 'ref_file')
     register.connect(anat2target_nonlinear, 'fieldcoeff_file',
                      warpmean, 'field_file')
@@ -1231,7 +1235,8 @@ def create_reg_workflow(name='registration'):
                          nested=True,
                          name='warpall')
     register.connect(inputnode, 'source_files', warpall, 'in_file')
-    register.connect(mean2anatbbr, 'out_matrix_file', warpall, 'premat')
+    register.connect(mean2anatbbr if do_func2anat_bbr else mean2anat, 'out_matrix_file',
+                     warpall, 'premat')
     register.connect(inputnode, 'target_image', warpall, 'ref_file')
     register.connect(anat2target_nonlinear, 'fieldcoeff_file',
                      warpall, 'field_file')
@@ -1242,10 +1247,11 @@ def create_reg_workflow(name='registration'):
 
     register.connect(warpmean, 'out_file', outputnode, 'transformed_mean')
     register.connect(warpall, 'out_file', outputnode, 'transformed_files')
-    register.connect(mean2anatbbr, 'out_matrix_file',
+    register.connect(mean2anatbbr if do_func2anat_bbr else mean2anat, 'out_matrix_file',
                      outputnode, 'func2anat_transform')
     register.connect(anat2target_nonlinear, 'fieldcoeff_file',
                      outputnode, 'anat2target_transform')
-
+    register.connect(anat2target_nonlinear, 'warped_file',
+                     outputnode, 'anat2target_transformed')
     return register
 
